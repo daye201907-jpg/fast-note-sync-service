@@ -266,6 +266,10 @@ func TestAtomicWrite_InvalidPreconditionAndKillSwitch(t *testing.T) {
 	require.Equal(t, "allowed", repo.must("path-switch").Content)
 }
 
+// TestAtomicWrite_WSStyleWriterHoldsLockThenStaleRESTRejects only calls
+// ModifyOrCreate twice on the shared per-path mutex. The first call uses
+// mtimeCheck the way a non-atomic WebSocket NoteModify does. It does not open
+// a websocket and does not exercise delete, rename, or history restore.
 func TestAtomicWrite_WSStyleWriterHoldsLockThenStaleRESTRejects(t *testing.T) {
 	repo, svc := newAtomicSvc()
 	original := repo.seed(liveNote("shared.md", "path-shared", "base-body", 1, 10))
@@ -417,6 +421,41 @@ func TestAtomicWrite_ReplaceAndAppendRejectStaleBase(t *testing.T) {
 	require.Equal(t, "delta", repo.must("path-edit").Content)
 }
 
+func TestAtomicWrite_DeleteInsideLockBlocksResurrection(t *testing.T) {
+	repo := newMemNoteRepo()
+	svc := service.NewNoteService(nil, repo, nil, nil, nopShare{}, nil, nopVault{}, nopFolder{}, nil, nil, nil, nil).WithClient("rest", "workbench", "test")
+	original := repo.seed(liveNote("gone.md", "path-del", "live-body", 3, 30))
+	repo.includeGate.arm()
+
+	delDone := make(chan error, 1)
+	go func() {
+		_, err := svc.Delete(context.Background(), 1, &dto.NoteDeleteRequest{
+			Vault: "vault", Path: original.Path, PathHash: original.PathHash,
+		})
+		delDone <- err
+	}()
+	select {
+	case <-repo.includeGate.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("delete did not reach the locked re-read")
+	}
+
+	atomicDone := make(chan error, 1)
+	go func() {
+		_, _, err := svc.ModifyOrCreate(context.Background(), 1, atomicWrite(original, "should-not-resurrect", 40), false)
+		atomicDone <- err
+	}()
+	time.Sleep(30 * time.Millisecond)
+	close(repo.includeGate.release)
+
+	require.NoError(t, <-delDone)
+	require.Equal(t, dto.NoteConflictDeleted, conflictReason(t, <-atomicDone))
+	got := repo.must("path-del")
+	require.Equal(t, domain.NoteActionDelete, got.Action)
+	require.Equal(t, "live-body", got.Content)
+	require.Equal(t, original.ContentHash, got.ContentHash)
+}
+
 type onceGate struct {
 	mu      sync.Mutex
 	armed   bool
@@ -447,13 +486,14 @@ func (g *onceGate) pause() {
 }
 
 type memNoteRepo struct {
-	mu         sync.Mutex
-	rows       map[string]*domain.Note
-	nextID     int64
-	updates    int
-	creates    int
-	getAllGate onceGate
-	getByGate  onceGate
+	mu          sync.Mutex
+	rows        map[string]*domain.Note
+	nextID      int64
+	updates     int
+	creates     int
+	getAllGate  onceGate
+	getByGate   onceGate
+	includeGate onceGate
 }
 
 func newMemNoteRepo() *memNoteRepo {
@@ -583,8 +623,20 @@ func (m *memNoteRepo) CountSizeSum(context.Context, int64, int64) (*domain.Count
 func (m *memNoteRepo) GetByID(context.Context, int64, int64) (*domain.Note, error) {
 	panic("unused")
 }
-func (m *memNoteRepo) GetByPathHashIncludeRecycle(context.Context, string, int64, int64, bool) (*domain.Note, error) {
-	panic("unused")
+func (m *memNoteRepo) GetByPathHashIncludeRecycle(_ context.Context, pathHash string, vaultID, uid int64, isRecycle bool) (*domain.Note, error) {
+	m.mu.Lock()
+	n := m.rows[repoKey(uid, vaultID, pathHash)]
+	var cp *domain.Note
+	if n != nil && ((isRecycle && n.Action == domain.NoteActionDelete && n.Rename == 0) || (!isRecycle && n.Action != domain.NoteActionDelete)) {
+		cloned := *n
+		cp = &cloned
+	}
+	m.mu.Unlock()
+	m.includeGate.pause()
+	if cp == nil {
+		return nil, gorm.ErrRecordNotFound
+	}
+	return cp, nil
 }
 func (m *memNoteRepo) ListByPathHash(context.Context, string, int64, int64) ([]*domain.Note, error) {
 	panic("unused")
@@ -595,9 +647,24 @@ func (m *memNoteRepo) ListByPathHashesMeta(context.Context, []string, int64, int
 func (m *memNoteRepo) GetByPath(context.Context, string, int64, int64) (*domain.Note, error) {
 	panic("unused")
 }
-func (m *memNoteRepo) UpdateDelete(context.Context, *domain.Note, int64) error { panic("unused") }
-func (m *memNoteRepo) UpdateMtime(context.Context, int64, int64, int64) error  { panic("unused") }
-func (m *memNoteRepo) UpdateFID(context.Context, int64, int64, int64) error    { panic("unused") }
+func (m *memNoteRepo) UpdateDelete(_ context.Context, note *domain.Note, _ int64) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, n := range m.rows {
+		if n.ID == note.ID {
+			n.Action = note.Action
+			n.Rename = note.Rename
+			n.ClientName = note.ClientName
+			n.ClientType = note.ClientType
+			n.ClientVersion = note.ClientVersion
+			n.Mtime = note.Mtime
+			return nil
+		}
+	}
+	return gorm.ErrRecordNotFound
+}
+func (m *memNoteRepo) UpdateMtime(context.Context, int64, int64, int64) error { panic("unused") }
+func (m *memNoteRepo) UpdateFID(context.Context, int64, int64, int64) error   { panic("unused") }
 func (m *memNoteRepo) UpdateSnapshot(context.Context, string, string, int64, int64, int64) error {
 	panic("unused")
 }
@@ -655,6 +722,38 @@ func (m *memNoteRepo) DeleteByVaultID(context.Context, int64, int64) error { pan
 func (m *memNoteRepo) RebuildVaultIndex(context.Context, int64, int64) error {
 	panic("unused")
 }
+
+type nopShare struct{}
+
+func (nopShare) Create(context.Context, int64, *domain.UserShare) error { return nil }
+func (nopShare) GetByID(context.Context, int64, int64) (*domain.UserShare, error) {
+	return nil, gorm.ErrRecordNotFound
+}
+func (nopShare) GetByPath(context.Context, int64, int64, string) (*domain.UserShare, error) {
+	return nil, gorm.ErrRecordNotFound
+}
+func (nopShare) GetByRes(context.Context, int64, string, int64) (*domain.UserShare, error) {
+	return nil, gorm.ErrRecordNotFound
+}
+func (nopShare) UpdateResources(context.Context, int64, int64, map[string][]string) error { return nil }
+func (nopShare) UpdateStatus(context.Context, int64, int64, int64) error                  { return nil }
+func (nopShare) UpdateStatusByRes(context.Context, int64, string, int64, int64) error     { return nil }
+func (nopShare) UpdateViewStats(context.Context, int64, int64, int64, time.Time) error    { return nil }
+func (nopShare) UpdatePassword(context.Context, int64, int64, string) error               { return nil }
+func (nopShare) UpdateExpiresAt(context.Context, int64, int64, time.Time) error           { return nil }
+func (nopShare) UpdateShortLink(context.Context, int64, int64, string) error              { return nil }
+func (nopShare) ListByUID(context.Context, int64, string, string, int, int) ([]*domain.UserShare, error) {
+	return nil, nil
+}
+func (nopShare) CountByUID(context.Context, int64) (int64, error) { return 0, nil }
+func (nopShare) ListActiveNoteResIDs(context.Context, int64) ([]int64, error) {
+	return nil, nil
+}
+func (nopShare) ListChangedNoteResIDs(context.Context, int64, time.Time) ([]int64, []int64, error) {
+	return nil, nil, nil
+}
+func (nopShare) MigrateResID(context.Context, int64, int64, int64) error { return nil }
+func (nopShare) DeleteByVaultID(context.Context, int64, int64) error     { return nil }
 
 type nopVault struct{}
 

@@ -49,6 +49,13 @@ type NoteService interface {
 	// 查到的 note（针对同一 pathHash）可跳过内部查询；不传（或传 nil）则按原逻辑查询。
 	ModifyOrCreate(ctx context.Context, uid int64, params *dto.NoteModifyOrCreateRequest, mtimeCheck bool, existingNote ...*domain.Note) (bool, *dto.NoteDTO, error)
 
+	// HoldNoteWriteLock runs fn while holding the same per-path mutex as ModifyOrCreate.
+	// Path hashes are locked in sorted order. fn must re-read any note it mutates;
+	// a snapshot taken before the lock is stale once another writer has committed.
+	// HoldNoteWriteLock 在与 ModifyOrCreate 相同的按路径锁内执行 fn。
+	// 路径哈希按字典序加锁。fn 必须重新读取要修改的笔记。
+	HoldNoteWriteLock(uid, vaultID int64, pathHashes []string, fn func() error) error
+
 	// Delete deletes a note
 	// Delete 删除笔记
 	Delete(ctx context.Context, uid int64, params *dto.NoteDeleteRequest) (*dto.NoteDTO, error)
@@ -380,7 +387,7 @@ func (s *noteService) ModifyOrCreate(ctx context.Context, uid int64, params *dto
 		preFetchedNote = nil
 	}
 
-	key := fmt.Sprintf("modify_or_create_%d_%d_%s", uid, vaultID, params.PathHash)
+	key := noteWriteKey(uid, vaultID, params.PathHash)
 	type result struct {
 		isNew bool
 		dto   *dto.NoteDTO
@@ -551,6 +558,12 @@ func (s *noteService) ModifyOrCreate(ctx context.Context, uid int64, params *dto
 	}
 
 	res := val.(*result)
+	if params.Atomic && res.dto != nil {
+		// Old binaries omit this field and still return code 1. Callers must
+		// require it before treating the response as an atomic commit.
+		// 旧二进制不会带这个字段，但仍可能返回 code 1。调用方必须见到它才算原子提交。
+		res.dto.AtomicApplied = true
+	}
 	return res.isNew, res.dto, nil
 }
 
@@ -563,54 +576,55 @@ func (s *noteService) Delete(ctx context.Context, uid int64, params *dto.NoteDel
 		return nil, err // VaultService 已返回 code.Error
 	}
 
-	note, err := s.noteRepo.GetByPathHashIncludeRecycle(ctx, params.PathHash, vaultID, uid, false)
-	if err != nil {
-		if errors.Is(err, gorm.ErrRecordNotFound) {
-			return nil, code.ErrorNoteNotFound
+	var dtoNote *dto.NoteDTO
+	err = s.HoldNoteWriteLock(uid, vaultID, []string{params.PathHash}, func() error {
+		// Re-read inside the lock. A note observed before the lock can already
+		// have been replaced by an atomic write.
+		// 在锁内重新读取。锁外看到的笔记可能已经被条件写入替换。
+		note, err := s.noteRepo.GetByPathHashIncludeRecycle(ctx, params.PathHash, vaultID, uid, false)
+		if err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return code.ErrorNoteNotFound
+			}
+			return code.ErrorDBQuery.WithDetails(err.Error())
 		}
-		return nil, code.ErrorDBQuery.WithDetails(err.Error())
-	}
 
-	// Update to deleted status // 更新为删除状态
-	note.Action = domain.NoteActionDelete
-	note.ClientName = s.clientName
-	note.ClientType = s.clientType
-	note.ClientVersion = s.clientVer
-	note.Rename = 0
+		note.Action = domain.NoteActionDelete
+		note.ClientName = s.clientName
+		note.ClientType = s.clientType
+		note.ClientVersion = s.clientVer
+		note.Rename = 0
 
-	err = s.noteRepo.UpdateDelete(ctx, note, uid)
-	if err != nil {
-		return nil, code.ErrorDBQuery.WithDetails(err.Error())
-	}
+		if err := s.noteRepo.UpdateDelete(ctx, note, uid); err != nil {
+			return code.ErrorDBQuery.WithDetails(err.Error())
+		}
 
-	// If note has active share, automatically revoke (to prevent count residue) // 若笔记有 active 分享，自动撤销（防止计数残留）
-	if err := s.shareRepo.UpdateStatusByRes(ctx, uid, "note", note.ID, domain.UserShareStatusRevoked); err != nil {
-		zap.L().Warn("Failed to revoke share on note deletion",
-			zap.Int64("uid", uid),
-			zap.Int64("noteId", note.ID),
-			zap.String("pathHash", params.PathHash),
-			zap.Error(err),
-		)
-	}
+		if s.shareRepo != nil {
+			if err := s.shareRepo.UpdateStatusByRes(ctx, uid, "note", note.ID, domain.UserShareStatusRevoked); err != nil {
+				zap.L().Warn("Failed to revoke share on note deletion",
+					zap.Int64("uid", uid),
+					zap.Int64("noteId", note.ID),
+					zap.String("pathHash", params.PathHash),
+					zap.Error(err),
+				)
+			}
+		}
 
-	// Log soft delete // 记录软删除日志
-	if s.syncLogService != nil {
-		s.syncLogService.Log(uid, vaultID, domain.SyncLogTypeNote, domain.SyncLogActionSoftDelete, "", note.Path, note.PathHash, s.clientType, s.clientName, s.clientVer, note.Size)
-	}
+		if s.syncLogService != nil {
+			s.syncLogService.Log(uid, vaultID, domain.SyncLogTypeNote, domain.SyncLogActionSoftDelete, "", note.Path, note.PathHash, s.clientType, s.clientName, s.clientVer, note.Size)
+		}
 
-	// note 已经是 UpdateDelete 写入后的准确状态（UpdateDelete 会把实际写入的
-	// UpdatedTimestamp 回写到 note 上），无需重新查库
-	// note already reflects the post-write state (UpdateDelete writes the persisted
-	// UpdatedTimestamp back onto it), no re-query needed
-	NoteHistoryDelayPush(note.ID, uid)
-	if s.backupService != nil {
-		go s.backupService.NotifyUpdated(uid)
-	}
-	if s.gitSyncService != nil {
-		go s.gitSyncService.NotifyUpdated(uid, vaultID)
-	}
-
-	return s.domainToDTO(note), nil
+		NoteHistoryDelayPush(note.ID, uid)
+		if s.backupService != nil {
+			go s.backupService.NotifyUpdated(uid)
+		}
+		if s.gitSyncService != nil {
+			go s.gitSyncService.NotifyUpdated(uid, vaultID)
+		}
+		dtoNote = s.domainToDTO(note)
+		return nil
+	})
+	return dtoNote, err
 }
 
 // Restore restores a note (from recycle bin)
@@ -622,58 +636,51 @@ func (s *noteService) Restore(ctx context.Context, uid int64, params *dto.NoteRe
 		return nil, err // VaultService 已返回 code.Error
 	}
 
-	// Get note from recycle bin // 从回收站获取笔记
-	note, err := s.noteRepo.GetByPathHashIncludeRecycle(ctx, params.PathHash, vaultID, uid, true)
-	if err != nil {
-		if errors.Is(err, gorm.ErrRecordNotFound) {
-			return nil, code.ErrorNoteNotFound
+	var dtoNote *dto.NoteDTO
+	err = s.HoldNoteWriteLock(uid, vaultID, []string{params.PathHash}, func() error {
+		note, err := s.noteRepo.GetByPathHashIncludeRecycle(ctx, params.PathHash, vaultID, uid, true)
+		if err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return code.ErrorNoteNotFound
+			}
+			return code.ErrorDBQuery.WithDetails(err.Error())
 		}
-		return nil, code.ErrorDBQuery.WithDetails(err.Error())
-	}
+		if note.Action != domain.NoteActionDelete {
+			return code.ErrorNoteNotFound
+		}
 
-	// Check if note is deleted // 检查笔记是否已删除
-	if note.Action != domain.NoteActionDelete {
-		return nil, code.ErrorNoteNotFound
-	}
+		note.Action = domain.NoteActionModify
+		note.ClientName = s.clientName
+		note.ClientType = s.clientType
+		note.ClientVersion = s.clientVer
+		note.Mtime = time.Now().UnixMilli()
+		note.Rename = 0
 
-	// Update to modified status and update modification time // 更新为修改状态 并更新修改时间
-	note.Action = domain.NoteActionModify
-	note.ClientName = s.clientName
-	note.ClientType = s.clientType
-	note.ClientVersion = s.clientVer
-	note.Mtime = time.Now().UnixMilli()
-	note.Rename = 0
+		if err := s.noteRepo.UpdateDelete(ctx, note, uid); err != nil {
+			return code.ErrorDBQuery.WithDetails(err.Error())
+		}
+		if s.syncLogService != nil {
+			s.syncLogService.Log(uid, vaultID, domain.SyncLogTypeNote, domain.SyncLogActionRestore, "", note.Path, note.PathHash, s.clientType, s.clientName, s.clientVer, note.Size)
+		}
 
-	err = s.noteRepo.UpdateDelete(ctx, note, uid)
-	if err != nil {
-		return nil, code.ErrorDBQuery.WithDetails(err.Error())
-	}
-
-	// Log restore // 记录恢复日志
-	if s.syncLogService != nil {
-		s.syncLogService.Log(uid, vaultID, domain.SyncLogTypeNote, domain.SyncLogActionRestore, "", note.Path, note.PathHash, s.clientType, s.clientName, s.clientVer, note.Size)
-	}
-
-	// Re-fetch the updated note
-	// 重新获取更新后的笔记
-	updated, err := s.noteRepo.GetByID(ctx, note.ID, uid)
-	if err != nil {
-		return nil, code.ErrorDBQuery.WithDetails(err.Error())
-	}
-
-	go s.folderService.SyncResourceFID(context.Background(), uid, vaultID, []int64{updated.ID}, nil)
-	go s.CountSizeSum(context.Background(), vaultID, uid)
-	go s.UpdateNoteLinks(context.Background(), updated.ID, updated.Content, vaultID, uid)
-
-	NoteHistoryDelayPush(updated.ID, uid)
-	if s.backupService != nil {
-		go s.backupService.NotifyUpdated(uid)
-	}
-	if s.gitSyncService != nil {
-		go s.gitSyncService.NotifyUpdated(uid, vaultID)
-	}
-
-	return s.domainToDTO(updated), nil
+		updated, err := s.noteRepo.GetByID(ctx, note.ID, uid)
+		if err != nil {
+			return code.ErrorDBQuery.WithDetails(err.Error())
+		}
+		go s.folderService.SyncResourceFID(context.Background(), uid, vaultID, []int64{updated.ID}, nil)
+		go s.CountSizeSum(context.Background(), vaultID, uid)
+		go s.UpdateNoteLinks(context.Background(), updated.ID, updated.Content, vaultID, uid)
+		NoteHistoryDelayPush(updated.ID, uid)
+		if s.backupService != nil {
+			go s.backupService.NotifyUpdated(uid)
+		}
+		if s.gitSyncService != nil {
+			go s.gitSyncService.NotifyUpdated(uid, vaultID)
+		}
+		dtoNote = s.domainToDTO(updated)
+		return nil
+	})
+	return dtoNote, err
 }
 
 // Rename renames a note
@@ -696,120 +703,128 @@ func (s *noteService) Rename(ctx context.Context, uid int64, params *dto.NoteRen
 		newNote *dto.NoteDTO
 	}
 
+	oldPath := strings.Trim(params.OldPath, "/")
+	oldPathHash := params.OldPathHash
+	if oldPathHash == "" {
+		oldPathHash = util.EncodeHash32(oldPath)
+	}
+
 	val, err, _ := s.sf.Do(key, func() (any, error) {
-		// 1. Check if target path has valid note
-		// 1. 判断目标路径是否存在有效笔记
-		existNote, _ := s.noteRepo.GetAllByPathHash(ctx, newPathHash, vaultID, uid)
-		if existNote != nil && existNote.Action != domain.NoteActionDelete {
-			return nil, code.ErrorNoteExist
-		}
-
-		oldPath := strings.Trim(params.OldPath, "/")
-		oldPathHash := params.OldPathHash
-		if oldPathHash == "" {
-			oldPathHash = util.EncodeHash32(oldPath)
-		}
-
-		// 2. Get old note
-		// 2. 获取旧笔记
-		n, err := s.noteRepo.GetByPathHash(ctx, oldPathHash, vaultID, uid)
-		if err != nil {
-			if errors.Is(err, gorm.ErrRecordNotFound) {
-				return nil, code.ErrorNoteNotFound
+		var renamed *result
+		lockErr := s.HoldNoteWriteLock(uid, vaultID, []string{oldPathHash, newPathHash}, func() error {
+			// 1. Check if target path has valid note
+			// 1. 判断目标路径是否存在有效笔记
+			existNote, _ := s.noteRepo.GetAllByPathHash(ctx, newPathHash, vaultID, uid)
+			if existNote != nil && existNote.Action != domain.NoteActionDelete {
+				return code.ErrorNoteExist
 			}
-			return nil, code.ErrorDBQuery.WithDetails(err.Error())
-		}
 
-		// 3. Mark old note as deleted with rename flag
-		// 3. 标记旧笔记删除并带上重命名标志
-		n.Action = domain.NoteActionDelete
-		n.Rename = 1
-		n.ClientName = s.clientName
-		n.ClientType = s.clientType
-		n.ClientVersion = s.clientVer
-		n.UpdatedTimestamp = timex.Now().UnixMilli()
-		oldNote, err := s.noteRepo.Update(ctx, n, uid)
-		if err != nil {
-			return nil, code.ErrorDBQuery.WithDetails(err.Error())
-		}
-
-		// 4. New or reuse note record
-		// 4. 新建或复用笔记记录
-		var newNoteCreated *domain.Note
-		if existNote != nil {
-			// Reuse deleted record // 复用已删除的记录
-			existNote.Action = domain.NoteActionCreate
-			existNote.Rename = 0 // Reset rename flag to ensure correct note count statistics
-			existNote.Path = newPath
-			existNote.PathHash = newPathHash
-			newPathDir := ""
-			if idx := strings.LastIndex(newPath, "/"); idx >= 0 {
-				newPathDir = newPath[:idx]
+			// 2. Get old note
+			// 2. 获取旧笔记
+			n, err := s.noteRepo.GetByPathHash(ctx, oldPathHash, vaultID, uid)
+			if err != nil {
+				if errors.Is(err, gorm.ErrRecordNotFound) {
+					return code.ErrorNoteNotFound
+				}
+				return code.ErrorDBQuery.WithDetails(err.Error())
 			}
-			existNote.FID, _ = s.folderService.EnsurePathFID(ctx, uid, vaultID, newPathDir)
-			existNote.Content = n.Content
-			existNote.ContentHash = n.ContentHash
-			existNote.Version = n.Version
-			existNote.Mtime = n.Mtime // Preserve original mtime // 保留原始修改时间
-			existNote.ClientName = s.clientName
-			existNote.ClientType = s.clientType
-			existNote.ClientVersion = s.clientVer
-			existNote.UpdatedTimestamp = timex.Now().UnixMilli()
-			newNoteCreated, err = s.noteRepo.Update(ctx, existNote, uid)
-		} else {
-			// Create new record // 创建新记录
-			newNote := &domain.Note{
-				VaultID:          vaultID,
-				Action:           domain.NoteActionCreate,
-				Path:             newPath,
-				PathHash:         newPathHash,
-				FID:              n.FID,
-				Ctime:            n.Ctime,
-				Mtime:            n.Mtime, // Preserve original mtime // 保留原始修改时间
-				ClientName:       s.clientName,
-				ClientType:       s.clientType,
-				ClientVersion:    s.clientVer,
-				UpdatedTimestamp: timex.Now().UnixMilli(),
-				Content:          n.Content,
-				ContentHash:      n.ContentHash,
-				Version:          n.Version,
+
+			// 3. Mark old note as deleted with rename flag
+			// 3. 标记旧笔记删除并带上重命名标志
+			n.Action = domain.NoteActionDelete
+			n.Rename = 1
+			n.ClientName = s.clientName
+			n.ClientType = s.clientType
+			n.ClientVersion = s.clientVer
+			n.UpdatedTimestamp = timex.Now().UnixMilli()
+			oldNote, err := s.noteRepo.Update(ctx, n, uid)
+			if err != nil {
+				return code.ErrorDBQuery.WithDetails(err.Error())
 			}
-			newPathDir := ""
-			if idx := strings.LastIndex(newPath, "/"); idx >= 0 {
-				newPathDir = newPath[:idx]
+
+			// 4. New or reuse note record
+			// 4. 新建或复用笔记记录
+			var newNoteCreated *domain.Note
+			if existNote != nil {
+				// Reuse deleted record // 复用已删除的记录
+				existNote.Action = domain.NoteActionCreate
+				existNote.Rename = 0 // Reset rename flag to ensure correct note count statistics
+				existNote.Path = newPath
+				existNote.PathHash = newPathHash
+				newPathDir := ""
+				if idx := strings.LastIndex(newPath, "/"); idx >= 0 {
+					newPathDir = newPath[:idx]
+				}
+				existNote.FID, _ = s.folderService.EnsurePathFID(ctx, uid, vaultID, newPathDir)
+				existNote.Content = n.Content
+				existNote.ContentHash = n.ContentHash
+				existNote.Version = n.Version
+				existNote.Mtime = n.Mtime // Preserve original mtime // 保留原始修改时间
+				existNote.ClientName = s.clientName
+				existNote.ClientType = s.clientType
+				existNote.ClientVersion = s.clientVer
+				existNote.UpdatedTimestamp = timex.Now().UnixMilli()
+				newNoteCreated, err = s.noteRepo.Update(ctx, existNote, uid)
+			} else {
+				// Create new record // 创建新记录
+				newNote := &domain.Note{
+					VaultID:          vaultID,
+					Action:           domain.NoteActionCreate,
+					Path:             newPath,
+					PathHash:         newPathHash,
+					FID:              n.FID,
+					Ctime:            n.Ctime,
+					Mtime:            n.Mtime, // Preserve original mtime // 保留原始修改时间
+					ClientName:       s.clientName,
+					ClientType:       s.clientType,
+					ClientVersion:    s.clientVer,
+					UpdatedTimestamp: timex.Now().UnixMilli(),
+					Content:          n.Content,
+					ContentHash:      n.ContentHash,
+					Version:          n.Version,
+				}
+				newPathDir := ""
+				if idx := strings.LastIndex(newPath, "/"); idx >= 0 {
+					newPathDir = newPath[:idx]
+				}
+				// Ensure FID is correct // 确保 FID 正确
+				newNote.FID, _ = s.folderService.EnsurePathFID(ctx, uid, vaultID, newPathDir)
+				newNoteCreated, err = s.noteRepo.Create(ctx, newNote, uid)
 			}
-			// Ensure FID is correct // 确保 FID 正确
-			newNote.FID, _ = s.folderService.EnsurePathFID(ctx, uid, vaultID, newPathDir)
-			newNoteCreated, err = s.noteRepo.Create(ctx, newNote, uid)
-		}
 
-		if err != nil {
-			return nil, code.ErrorDBQuery.WithDetails(err.Error())
-		}
+			if err != nil {
+				return code.ErrorDBQuery.WithDetails(err.Error())
+			}
 
-		// Log rename // 记录重命名日志
-		if s.syncLogService != nil {
-			s.syncLogService.Log(uid, vaultID, domain.SyncLogTypeNote, domain.SyncLogActionRename, "path", newNoteCreated.Path, newNoteCreated.PathHash, s.clientType, s.clientName, s.clientVer, newNoteCreated.Size)
-		}
+			// Log rename // 记录重命名日志
+			if s.syncLogService != nil {
+				s.syncLogService.Log(uid, vaultID, domain.SyncLogTypeNote, domain.SyncLogActionRename, "path", newNoteCreated.Path, newNoteCreated.PathHash, s.clientType, s.clientName, s.clientVer, newNoteCreated.Size)
+			}
 
-		go s.folderService.SyncResourceFID(context.Background(), uid, vaultID, []int64{newNoteCreated.ID}, nil)
-		if err := s.folderService.CleanupEmptyAncestors(ctx, uid, vaultID, oldPath); err != nil {
-			zap.L().Warn("noteService.Rename: cleanup empty ancestor folders failed",
-				zap.Int64("uid", uid),
-				zap.Int64("vaultID", vaultID),
-				zap.String("oldPath", oldPath),
-				zap.Error(err),
-			)
-		}
-		go s.Migrate(context.Background(), n.ID, newNoteCreated.ID, uid)
-		if s.backupService != nil {
-			go s.backupService.NotifyUpdated(uid)
-		}
-		if s.gitSyncService != nil {
-			go s.gitSyncService.NotifyUpdated(uid, vaultID)
-		}
+			go s.folderService.SyncResourceFID(context.Background(), uid, vaultID, []int64{newNoteCreated.ID}, nil)
+			if err := s.folderService.CleanupEmptyAncestors(ctx, uid, vaultID, oldPath); err != nil {
+				zap.L().Warn("noteService.Rename: cleanup empty ancestor folders failed",
+					zap.Int64("uid", uid),
+					zap.Int64("vaultID", vaultID),
+					zap.String("oldPath", oldPath),
+					zap.Error(err),
+				)
+			}
+			go s.Migrate(context.Background(), n.ID, newNoteCreated.ID, uid)
+			if s.backupService != nil {
+				go s.backupService.NotifyUpdated(uid)
+			}
+			if s.gitSyncService != nil {
+				go s.gitSyncService.NotifyUpdated(uid, vaultID)
+			}
 
-		return &result{oldNote: s.domainToDTO(oldNote), newNote: s.domainToDTO(newNoteCreated)}, nil
+			renamed = &result{oldNote: s.domainToDTO(oldNote), newNote: s.domainToDTO(newNoteCreated)}
+			return nil
+		})
+		if lockErr != nil {
+			return nil, lockErr
+		}
+		return renamed, nil
 	})
 
 	if err != nil {

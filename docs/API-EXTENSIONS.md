@@ -16,9 +16,14 @@ Returns server health status including database connectivity and uptime.
   "status": "healthy",
   "version": "1.11.1",
   "uptime": 123.45,
-  "database": "connected"
+  "database": "connected",
+  "capabilities": {
+    "atomicNoteWrite": {"supported": true, "enabled": true}
+  }
 }
 ```
+
+`status`, `version`, `uptime`, and `database` are the original fields. `capabilities` is added by the conditional-write build. If it is missing, or `enabled` is false, do not send an atomic note write. A successful note response counts as an atomic commit only when `atomicApplied` is true.
 
 ### Note Operations
 

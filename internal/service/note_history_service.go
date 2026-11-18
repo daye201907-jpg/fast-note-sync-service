@@ -373,19 +373,32 @@ func (s *noteHistoryService) RestoreFromHistory(ctx context.Context, uid int64, 
 		zap.Int("afterContentLen", len(restoredContent)),
 	)
 
-	// 5. Update note with restored content and set modification time
-	// 5. 使用恢复的内容更新笔记, 并设置修改时间
-	note.Content = restoredContent
-	note.ContentHash = restoredContentHash
-	note.Mtime = timex.Now().UnixMilli()
-	note.Action = domain.NoteActionModify
-	note.Rename = 0
-
-	// 6. Update note
-	// 6. 更新笔记
-	updated, err := s.noteRepo.Update(ctx, note, uid)
+	// 5. Update note under the same per-path lock as conditional writes.
+	// Re-read inside the lock so this restore cannot commit between another
+	// writer's compare and its update.
+	// 5. 在与条件写入相同的按路径锁内更新，并在锁内重新读取。
+	var updated *domain.Note
+	err = s.noteService.HoldNoteWriteLock(uid, note.VaultID, []string{note.PathHash}, func() error {
+		fresh, err := s.noteRepo.GetByID(ctx, note.ID, uid)
+		if err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return code.ErrorNoteNotFound
+			}
+			return code.ErrorDBQuery.WithDetails(err.Error())
+		}
+		fresh.Content = restoredContent
+		fresh.ContentHash = restoredContentHash
+		fresh.Mtime = timex.Now().UnixMilli()
+		fresh.Action = domain.NoteActionModify
+		fresh.Rename = 0
+		updated, err = s.noteRepo.Update(ctx, fresh, uid)
+		if err != nil {
+			return code.ErrorDBQuery.WithDetails(err.Error())
+		}
+		return nil
+	})
 	if err != nil {
-		return nil, code.ErrorDBQuery.WithDetails(err.Error())
+		return nil, err
 	}
 
 	vaultID := history.VaultID

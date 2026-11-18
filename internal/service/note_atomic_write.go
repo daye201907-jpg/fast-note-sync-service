@@ -1,7 +1,9 @@
 package service
 
 import (
+	"fmt"
 	"os"
+	"sort"
 	"strings"
 
 	"github.com/haierkeys/fast-note-sync-service/internal/domain"
@@ -10,20 +12,54 @@ import (
 	"github.com/haierkeys/fast-note-sync-service/pkg/util"
 )
 
-// atomicNoteWriteEnabled reports whether an explicit conditional write is enforced.
+// AtomicNoteWriteEnabled reports whether an explicit conditional write is enforced.
 // Unset or any value other than 0/false/off/no keeps it on.
-// Turning it off rejects the opt-in and writes nothing. It does not fall back to
-// last-writer-wins, because the caller asked not to overwrite a stale revision.
-// Rolling back to a binary that predates this field ignores the opt-in entirely.
-// atomicNoteWriteEnabled 表示显式条件写入是否生效。关闭时拒绝 opt-in 且不写入，
-// 不会退回后写覆盖。回滚到没有该字段的旧二进制则会忽略 opt-in。
-func atomicNoteWriteEnabled() bool {
+// Turning it off rejects the opt-in and writes nothing.
+// AtomicNoteWriteEnabled 表示显式条件写入是否生效。关闭时拒绝 opt-in 且不写入。
+func AtomicNoteWriteEnabled() bool {
 	switch strings.ToLower(strings.TrimSpace(os.Getenv("FNS_ATOMIC_NOTE_WRITE"))) {
 	case "0", "false", "off", "no":
 		return false
 	default:
 		return true
 	}
+}
+
+func noteWriteKey(uid, vaultID int64, pathHash string) string {
+	return fmt.Sprintf("modify_or_create_%d_%d_%s", uid, vaultID, pathHash)
+}
+
+// HoldNoteWriteLock serializes fn with ModifyOrCreate for the same note paths.
+// HoldNoteWriteLock 让 fn 与同一笔记路径上的 ModifyOrCreate 互斥。
+func (s *noteService) HoldNoteWriteLock(uid, vaultID int64, pathHashes []string, fn func() error) error {
+	if fn == nil {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(pathHashes))
+	keys := make([]string, 0, len(pathHashes))
+	for _, pathHash := range pathHashes {
+		key := noteWriteKey(uid, vaultID, pathHash)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	unlocks := make([]func(), 0, len(keys))
+	for _, key := range keys {
+		unlocks = append(unlocks, s.kmu.Lock(key))
+	}
+	defer func() {
+		for i := len(unlocks) - 1; i >= 0; i-- {
+			unlocks[i]()
+		}
+	}()
+	return fn()
+}
+
+func atomicNoteWriteEnabled() bool {
+	return AtomicNoteWriteEnabled()
 }
 
 // prepareAtomicWrite checks the opt-in before the per-note lock is taken.

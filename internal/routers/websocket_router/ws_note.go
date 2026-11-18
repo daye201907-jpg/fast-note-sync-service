@@ -107,9 +107,10 @@ func (h *NoteWSHandler) NoteModify(c *pkgapp.WebsocketClient, msg *pkgapp.WebSoc
 			return
 		}
 		c.ToResponse(code.Success.WithData(dto.NoteModifyAckMessage{
-			LastTime: note.UpdatedTimestamp,
-			Path:     note.Path,
-			PathHash: note.PathHash,
+			LastTime:      note.UpdatedTimestamp,
+			Path:          note.Path,
+			PathHash:      note.PathHash,
+			AtomicApplied: note.AtomicApplied,
 		}).WithVault(params.Vault).WithContext(params.Context), string(NoteModifyAck))
 		c.BroadcastResponse(code.Success.WithData(
 			dto.NoteSyncModifyMessage{

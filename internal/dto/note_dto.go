@@ -243,6 +243,10 @@ type NoteDTO struct {
 	UpdatedTimestamp int64      `json:"lastTime"`                       // Record update timestamp // 记录更新时间戳
 	UpdatedAt        timex.Time `json:"updatedAt"`                      // Updated at time // 更新时间
 	CreatedAt        timex.Time `json:"createdAt"`                      // Created at time // 创建时间
+	// AtomicApplied is set only after this process performed an opt-in conditional write.
+	// Old binaries omit it. A code 1 response without it is not an atomic commit.
+	// AtomicApplied 仅在本进程完成 opt-in 条件写入后为 true。旧二进制不会输出该字段。
+	AtomicApplied bool `json:"atomicApplied,omitempty"`
 }
 
 // NoteNoContentDTO Note DTO without content

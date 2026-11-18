@@ -43,6 +43,17 @@ const (
 // UTF-16 code units, as a signed 32-bit decimal string. It is not MD5.
 // The stored hash of an accepted atomic write is recomputed with that function.
 //
+// Client gate, because a 3.6.1 server ignores atomic and still returns code 1:
+//  1. Immediately before every submit, GET /api/health (startup alone is not enough).
+//  2. Require data.capabilities.atomicNoteWrite.supported == true and enabled == true.
+//     A missing capabilities object means the binary cannot do this. Do not send the write.
+//  3. On code 1, require data.atomicApplied == true. If it is absent, the write may
+//     already have landed without a compare; do not treat it as an atomic commit
+//     and do not send another write until health proves this binary again.
+//
+// 客户端门槛：3.6.1 会忽略 atomic 并返回 code 1。每次提交前立刻 GET /api/health。
+// 必须同时看到 supported 与 enabled。成功响应还必须带 data.atomicApplied。
+//
 // AtomicPrecondition 是单次笔记写入的显式比较并交换。Atomic 为 false（零值，
 // 以及所有现有同步客户端）保持后写覆盖。baseHash 不是前置条件。
 // Atomic 为 true 时只允许更新：在与 REST/WS 笔记写入相同的按路径锁内重新读取，
