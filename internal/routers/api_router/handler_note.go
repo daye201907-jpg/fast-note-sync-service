@@ -220,12 +220,32 @@ func (h *NoteHandler) CreateOrUpdate(c *gin.Context) {
 	if params.Ctime == 0 {
 		params.Ctime = params.Mtime
 	}
+	if err := applyAtomicWriteHeaders(c, &params.AtomicPrecondition); err != nil {
+		response.ToResponse(code.ErrorInvalidParams.WithDetails(err.Error()))
+		return
+	}
 
 	// Get request context
 	// 获取请求上下文
 	ctx := c.Request.Context()
 
 	noteSvc := h.App.GetNoteService(h.getClientInfo(c))
+
+	// Conditional writes skip UpdateCheck. That helper can change mtime before
+	// the per-note lock, and its snapshot must not be reused as a precondition.
+	// 条件写入跳过 UpdateCheck。该辅助函数会在按笔记锁之外改 mtime，
+	// 它的快照也不能当作前置修订复用。
+	if params.Atomic {
+		_, noteNew, err := noteSvc.ModifyOrCreate(ctx, uid, params, false)
+		if err != nil {
+			h.logError(ctx, "NoteHandler.CreateOrUpdate.Atomic", err)
+			respondWriteErr(c, err)
+			return
+		}
+		response.ToResponse(code.Success.WithData(noteNew))
+		h.WSS.BroadcastToUser(uid, code.Success.WithData(noteNew).WithVault(params.Vault), "NoteSyncModify")
+		return
+	}
 
 	// Check update
 	// 检查更新
@@ -255,7 +275,7 @@ func (h *NoteHandler) CreateOrUpdate(c *gin.Context) {
 	_, noteNew, err = noteSvc.ModifyOrCreate(ctx, uid, params, false, checkedNote)
 	if err != nil {
 		h.logError(ctx, "NoteHandler.CreateOrUpdate.NoteModifyOrCreate", err)
-		apperrors.ErrorResponse(c, err)
+		respondWriteErr(c, err)
 		return
 	}
 
@@ -452,6 +472,10 @@ func (h *NoteHandler) PatchFrontmatter(c *gin.Context) {
 	if params.PathHash == "" {
 		params.PathHash = util.EncodeHash32(params.Path)
 	}
+	if err := applyAtomicWriteHeaders(c, &params.AtomicPrecondition); err != nil {
+		response.ToResponse(code.ErrorInvalidParams.WithDetails(err.Error()))
+		return
+	}
 
 	// Get request context
 	// 获取请求上下文
@@ -461,7 +485,7 @@ func (h *NoteHandler) PatchFrontmatter(c *gin.Context) {
 	note, err := noteSvc.PatchFrontmatter(ctx, uid, params)
 	if err != nil {
 		h.logError(ctx, "NoteHandler.PatchFrontmatter", err)
-		apperrors.ErrorResponse(c, err)
+		respondWriteErr(c, err)
 		return
 	}
 
@@ -511,6 +535,10 @@ func (h *NoteHandler) Append(c *gin.Context) {
 	if params.PathHash == "" {
 		params.PathHash = util.EncodeHash32(params.Path)
 	}
+	if err := applyAtomicWriteHeaders(c, &params.AtomicPrecondition); err != nil {
+		response.ToResponse(code.ErrorInvalidParams.WithDetails(err.Error()))
+		return
+	}
 
 	// Get request context
 	// 获取请求上下文
@@ -520,7 +548,7 @@ func (h *NoteHandler) Append(c *gin.Context) {
 	note, err := noteSvc.AppendContent(ctx, uid, params)
 	if err != nil {
 		h.logError(ctx, "NoteHandler.Append", err)
-		apperrors.ErrorResponse(c, err)
+		respondWriteErr(c, err)
 		return
 	}
 
@@ -570,6 +598,10 @@ func (h *NoteHandler) Prepend(c *gin.Context) {
 	if params.PathHash == "" {
 		params.PathHash = util.EncodeHash32(params.Path)
 	}
+	if err := applyAtomicWriteHeaders(c, &params.AtomicPrecondition); err != nil {
+		response.ToResponse(code.ErrorInvalidParams.WithDetails(err.Error()))
+		return
+	}
 
 	// Get request context
 	// 获取请求上下文
@@ -579,7 +611,7 @@ func (h *NoteHandler) Prepend(c *gin.Context) {
 	note, err := noteSvc.PrependContent(ctx, uid, params)
 	if err != nil {
 		h.logError(ctx, "NoteHandler.Prepend", err)
-		apperrors.ErrorResponse(c, err)
+		respondWriteErr(c, err)
 		return
 	}
 
@@ -629,6 +661,10 @@ func (h *NoteHandler) Replace(c *gin.Context) {
 	if params.PathHash == "" {
 		params.PathHash = util.EncodeHash32(params.Path)
 	}
+	if err := applyAtomicWriteHeaders(c, &params.AtomicPrecondition); err != nil {
+		response.ToResponse(code.ErrorInvalidParams.WithDetails(err.Error()))
+		return
+	}
 
 	// Get request context
 	// 获取请求上下文
@@ -638,7 +674,7 @@ func (h *NoteHandler) Replace(c *gin.Context) {
 	result, err := noteSvc.ReplaceContent(ctx, uid, params)
 	if err != nil {
 		h.logError(ctx, "NoteHandler.Replace", err)
-		apperrors.ErrorResponse(c, err)
+		respondWriteErr(c, err)
 		return
 	}
 

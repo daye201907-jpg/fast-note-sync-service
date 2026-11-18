@@ -369,6 +369,17 @@ func (s *noteService) ModifyOrCreate(ctx context.Context, uid int64, params *dto
 		preFetchedNote = existingNote[0]
 	}
 
+	// Opt-in compare-and-swap is validated before the lock and always re-reads
+	// inside it. A snapshot taken before Lock is stale once another writer has
+	// already committed and released the same key.
+	// 显式条件写入在加锁前只做参数校验，锁内必须重新读取。锁外快照在其他写入已提交后是过期的。
+	if params.Atomic {
+		if err := prepareAtomicWrite(params); err != nil {
+			return false, nil, err
+		}
+		preFetchedNote = nil
+	}
+
 	key := fmt.Sprintf("modify_or_create_%d_%d_%s", uid, vaultID, params.PathHash)
 	type result struct {
 		isNew bool
@@ -399,6 +410,20 @@ func (s *noteService) ModifyOrCreate(ctx context.Context, uid int64, params *dto
 			note, _ = s.noteRepo.GetAllByPathHash(ctx, params.PathHash, vaultID, uid)
 		}
 
+		if params.Atomic {
+			noop, aerr := applyAtomicPrecondition(note, params)
+			if aerr != nil {
+				return nil, aerr
+			}
+			if noop {
+				return &result{isNew: false, dto: s.domainToDTO(note)}, nil
+			}
+			// Keep the stored creation time. The conditional write replaces body,
+			// content hash, version, and mtime only.
+			// 保留已存储的创建时间。条件写入只替换正文、内容哈希、版本和 mtime。
+			params.Ctime = note.Ctime
+		}
+
 		if note != nil {
 			isNew = false
 
@@ -407,13 +432,16 @@ func (s *noteService) ModifyOrCreate(ctx context.Context, uid int64, params *dto
 				return nil, code.ErrorNoteExist
 			}
 
-			// Check if content is consistent, excluding notes marked as deleted
-			if mtimeCheck && note.Action != domain.NoteActionDelete && note.Mtime == params.Mtime && note.ContentHash == params.ContentHash {
+			// Check if content is consistent, excluding notes marked as deleted.
+			// Atomic writes never take this metadata-only shortcut: a matching
+			// body already returned above, and a mismatched revision already rejected.
+			// 条件写入不走仅更新元数据的短路。
+			if !params.Atomic && mtimeCheck && note.Action != domain.NoteActionDelete && note.Mtime == params.Mtime && note.ContentHash == params.ContentHash {
 				return &result{isNew: isNew, dto: nil}, nil
 			}
 			// If content is consistent but modification time is different, only update modification time
 			// 检查内容是否一致但修改时间不同，则只更新修改时间
-			if mtimeCheck && note.Mtime < params.Mtime && note.ContentHash == params.ContentHash {
+			if !params.Atomic && mtimeCheck && note.Mtime < params.Mtime && note.ContentHash == params.ContentHash {
 				err := s.noteRepo.UpdateActionMtime(ctx, domain.NoteActionModify, params.Mtime, note.ID, uid)
 				if err != nil {
 					return nil, code.ErrorDBQuery.WithDetails(err.Error())
@@ -1087,15 +1115,20 @@ func (s *noteService) PatchFrontmatter(ctx context.Context, uid int64, params *d
 	// Reconstruct content
 	newContent := util.ReconstructContent(newYaml, body)
 
-	// Save via ModifyOrCreate
+	// Save via ModifyOrCreate. The opt-in revision is checked inside that lock
+	// against a fresh read, so a patch computed from this snapshot is discarded
+	// when the note changed.
+	// 通过 ModifyOrCreate 保存。opt-in 修订在那把锁内对照新读取校验，
+	// 笔记已变化时丢弃基于本次快照算出的补丁。
 	modifyParams := &dto.NoteModifyOrCreateRequest{
-		Vault:       params.Vault,
-		Path:        params.Path,
-		PathHash:    params.PathHash,
-		Content:     newContent,
-		ContentHash: util.EncodeHash32(newContent),
-		Mtime:       time.Now().UnixMilli(),
-		Ctime:       note.Ctime,
+		Vault:              params.Vault,
+		Path:               params.Path,
+		PathHash:           params.PathHash,
+		Content:            newContent,
+		ContentHash:        util.EncodeHash32(newContent),
+		Mtime:              time.Now().UnixMilli(),
+		Ctime:              note.Ctime,
+		AtomicPrecondition: params.AtomicPrecondition,
 	}
 
 	_, result, err := s.ModifyOrCreate(ctx, uid, modifyParams, false)
@@ -1129,13 +1162,14 @@ func (s *noteService) AppendContent(ctx context.Context, uid int64, params *dto.
 
 	// Save via ModifyOrCreate
 	modifyParams := &dto.NoteModifyOrCreateRequest{
-		Vault:       params.Vault,
-		Path:        params.Path,
-		PathHash:    params.PathHash,
-		Content:     newContent,
-		ContentHash: util.EncodeHash32(newContent),
-		Mtime:       time.Now().UnixMilli(),
-		Ctime:       note.Ctime,
+		Vault:              params.Vault,
+		Path:               params.Path,
+		PathHash:           params.PathHash,
+		Content:            newContent,
+		ContentHash:        util.EncodeHash32(newContent),
+		Mtime:              time.Now().UnixMilli(),
+		Ctime:              note.Ctime,
+		AtomicPrecondition: params.AtomicPrecondition,
 	}
 
 	_, result, err := s.ModifyOrCreate(ctx, uid, modifyParams, false)
@@ -1182,13 +1216,14 @@ func (s *noteService) PrependContent(ctx context.Context, uid int64, params *dto
 
 	// Save via ModifyOrCreate
 	modifyParams := &dto.NoteModifyOrCreateRequest{
-		Vault:       params.Vault,
-		Path:        params.Path,
-		PathHash:    params.PathHash,
-		Content:     newContent,
-		ContentHash: util.EncodeHash32(newContent),
-		Mtime:       time.Now().UnixMilli(),
-		Ctime:       note.Ctime,
+		Vault:              params.Vault,
+		Path:               params.Path,
+		PathHash:           params.PathHash,
+		Content:            newContent,
+		ContentHash:        util.EncodeHash32(newContent),
+		Mtime:              time.Now().UnixMilli(),
+		Ctime:              note.Ctime,
+		AtomicPrecondition: params.AtomicPrecondition,
 	}
 
 	_, result, err := s.ModifyOrCreate(ctx, uid, modifyParams, false)
@@ -1261,34 +1296,40 @@ func (s *noteService) ReplaceContent(ctx context.Context, uid int64, params *dto
 	// Check if no match found and fail flag is set
 	// Check if no match found and fail flag is set
 	// 检查是否未找到匹配项且设置了失败标志
-	if matchCount == 0 && params.FailIfNoMatch {
-		return nil, code.ErrorNoMatchFound
-	}
-
-	// If no changes, return early
-	// If no changes, return early
-	// 如果没有变化，提前返回
-	if newContent == note.Content {
-		return &dto.NoteReplaceResponse{
-			MatchCount: matchCount,
-			Note:       s.domainToDTO(note),
-		}, nil
+	// Non-atomic keeps the historical early return. An atomic caller must reach
+	// ModifyOrCreate so a stale snapshot cannot be reported as a successful no-op.
+	// 非 opt-in 保持原有提前返回。opt-in 必须进入 ModifyOrCreate，
+	// 避免把过期快照当成成功的空操作返回。
+	if !params.Atomic {
+		if matchCount == 0 && params.FailIfNoMatch {
+			return nil, code.ErrorNoMatchFound
+		}
+		if newContent == note.Content {
+			return &dto.NoteReplaceResponse{
+				MatchCount: matchCount,
+				Note:       s.domainToDTO(note),
+			}, nil
+		}
 	}
 
 	// Save via ModifyOrCreate
 	modifyParams := &dto.NoteModifyOrCreateRequest{
-		Vault:       params.Vault,
-		Path:        params.Path,
-		PathHash:    params.PathHash,
-		Content:     newContent,
-		ContentHash: util.EncodeHash32(newContent),
-		Mtime:       time.Now().UnixMilli(),
-		Ctime:       note.Ctime,
+		Vault:              params.Vault,
+		Path:               params.Path,
+		PathHash:           params.PathHash,
+		Content:            newContent,
+		ContentHash:        util.EncodeHash32(newContent),
+		Mtime:              time.Now().UnixMilli(),
+		Ctime:              note.Ctime,
+		AtomicPrecondition: params.AtomicPrecondition,
 	}
 
 	_, result, err := s.ModifyOrCreate(ctx, uid, modifyParams, false)
 	if err != nil {
 		return nil, err
+	}
+	if params.Atomic && matchCount == 0 && params.FailIfNoMatch {
+		return nil, code.ErrorNoMatchFound
 	}
 
 	return &dto.NoteReplaceResponse{

@@ -89,6 +89,42 @@ func (h *NoteWSHandler) NoteModify(c *pkgapp.WebsocketClient, msg *pkgapp.WebSoc
 	// 检查并创建仓库，内部使用SF合并并发请求, 避免重复创建问题
 	h.App.VaultService.GetOrCreate(ctx, c.User.UID, params.Vault)
 
+	// Explicit conditional writes do not enter merge, conflict-file creation, or
+	// the pre-lock manualMerge check. Those paths decide from a snapshot and can
+	// write before ModifyOrCreate. The revision compare is inside ModifyOrCreate,
+	// on the same lock as every other note content write. Clients that leave
+	// atomic unset keep the strategy below, including baseHash merge.
+	// 显式条件写入不进入合并、冲突文件或锁外的 manualMerge 判断。
+	// 修订比较在 ModifyOrCreate 内，与其他笔记内容写入同一把锁。
+	// 未设置 atomic 的客户端仍走下面的原策略，包括 baseHash 合并。
+	if params.Atomic {
+		_, note, err := noteSvc.ModifyOrCreate(ctx, c.User.UID, params, false)
+		if err != nil || note == nil {
+			if err == nil {
+				err = code.ErrorNoteModifyOrCreateFailed
+			}
+			h.respondError(c, code.ErrorNoteModifyOrCreateFailed, err, "websocket_router.note.NoteModify.Atomic", msg)
+			return
+		}
+		c.ToResponse(code.Success.WithData(dto.NoteModifyAckMessage{
+			LastTime: note.UpdatedTimestamp,
+			Path:     note.Path,
+			PathHash: note.PathHash,
+		}).WithVault(params.Vault).WithContext(params.Context), string(NoteModifyAck))
+		c.BroadcastResponse(code.Success.WithData(
+			dto.NoteSyncModifyMessage{
+				Path:             note.Path,
+				PathHash:         note.PathHash,
+				Content:          note.Content,
+				ContentHash:      note.ContentHash,
+				Ctime:            note.Ctime,
+				Mtime:            note.Mtime,
+				UpdatedTimestamp: note.UpdatedTimestamp,
+			},
+		).WithVault(params.Vault), true, NoteSyncModify)
+		return
+	}
+
 	checkParams := convert.StructAssign(params, &dto.NoteUpdateCheckRequest{}).(*dto.NoteUpdateCheckRequest)
 	updateMode, checkedNote, nodeCheck, err := noteSvc.UpdateCheckWithNote(ctx, c.User.UID, checkParams)
 
@@ -129,10 +165,10 @@ func (h *NoteWSHandler) NoteModify(c *pkgapp.WebsocketClient, msg *pkgapp.WebSoc
 			}
 
 			// =========================================================================
-			// Hard Conflict Protection: 
-			// If strategy is manualMerge, the request has no resolution mark, and serverHash 
+			// Hard Conflict Protection:
+			// If strategy is manualMerge, the request has no resolution mark, and serverHash
 			// differs from baseHash, block the override immediately and return 530.
-			// 
+			//
 			// 硬冲突保护：
 			// 如果合并策略为手动合并，请求中未携带解决标记，且云端哈希与客户端基准哈希不匹配，
 			// 直接拦截该覆写并返回 530 错误及冲突明细。
