@@ -1,6 +1,7 @@
 package api_router
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -15,6 +16,7 @@ import (
 	"github.com/haierkeys/fast-note-sync-service/pkg/code"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
+	"github.com/stretchr/testify/require"
 )
 
 // newNoteTestContext creates a gin.Context suitable for NoteHandler tests.
@@ -126,6 +128,65 @@ func TestNoteHandler_CreateOrUpdate_Success(t *testing.T) {
 
 	assert.Equal(t, http.StatusOK, w.Code)
 	assertResponseCode(t, w, code.Success.Code())
+}
+
+func TestNoteHandler_CreateOrUpdate_AtomicHeadersAndConflict(t *testing.T) {
+	ver := int64(4)
+	mt := int64(50)
+	mockNoteSvc := new(svcmocks.MockNoteService)
+	mockNoteSvc.On("ModifyOrCreate", mock.Anything, int64(1), mock.MatchedBy(func(p *dto.NoteModifyOrCreateRequest) bool {
+		return p.Atomic &&
+			p.ExpectedContentHash == "server-hash" &&
+			p.ExpectedVersion != nil && *p.ExpectedVersion == ver &&
+			p.ExpectedMtime != nil && *p.ExpectedMtime == mt &&
+			p.Content == "next body" &&
+			p.BaseHash == "ignored-by-atomic"
+	}), false, mock.Anything).Return(false, (*dto.NoteDTO)(nil), code.ErrorNoteRevisionConflict.WithData(&dto.NoteRevisionConflict{
+		Conflict:          true,
+		Reason:            dto.NoteConflictStaleRevision,
+		Path:              "todo.md",
+		PathHash:          "path-todo",
+		ServerContentHash: "newer-hash",
+		ServerVersion:     5,
+		ServerMtime:       80,
+		ServerAction:      "modify",
+	}))
+
+	handler := newTestNoteHandler(mockNoteSvc, nil)
+	body := `{"vault":"main","path":"todo.md","pathHash":"path-todo","content":"next body","contentHash":"99162322","baseHash":"ignored-by-atomic","ctime":1,"mtime":60,"atomic":true,"expectedContentHash":"server-hash","expectedVersion":4,"expectedMtime":50}`
+	c, w := newNoteTestContext("POST", "/api/note", body, 1)
+	c.Request.Header.Set(dto.HeaderAtomicWrite, "1")
+	c.Request.Header.Set(dto.HeaderExpectedContentHash, "server-hash")
+
+	handler.CreateOrUpdate(c)
+
+	require.Equal(t, http.StatusOK, w.Code)
+	var decoded map[string]any
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &decoded))
+	require.Equal(t, float64(531), decoded["code"])
+	require.Equal(t, false, decoded["status"])
+	data, ok := decoded["data"].(map[string]any)
+	require.True(t, ok, "body=%s", w.Body.String())
+	require.Equal(t, true, data["conflict"])
+	require.Equal(t, dto.NoteConflictStaleRevision, data["reason"])
+	require.Equal(t, "newer-hash", data["serverContentHash"])
+	require.Equal(t, float64(5), data["serverVersion"])
+	require.Equal(t, float64(80), data["serverMtime"])
+	mockNoteSvc.AssertNotCalled(t, "UpdateCheckWithNote", mock.Anything, mock.Anything, mock.Anything)
+}
+
+func TestNoteHandler_CreateOrUpdate_AtomicHeaderDisagreement(t *testing.T) {
+	mockNoteSvc := new(svcmocks.MockNoteService)
+	handler := newTestNoteHandler(mockNoteSvc, nil)
+	body := `{"vault":"main","path":"todo.md","content":"next","atomic":true,"expectedContentHash":"one","expectedVersion":1,"expectedMtime":1}`
+	c, w := newNoteTestContext("POST", "/api/note", body, 1)
+	c.Request.Header.Set(dto.HeaderExpectedContentHash, "two")
+
+	handler.CreateOrUpdate(c)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	assertResponseCode(t, w, code.ErrorInvalidParams.Code())
+	mockNoteSvc.AssertNotCalled(t, "ModifyOrCreate", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything)
 }
 
 // TestNoteHandler_Delete_Success verifies successful note deletion

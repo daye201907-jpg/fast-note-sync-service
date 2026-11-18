@@ -51,6 +51,13 @@ func (m *MockNoteService) UpdateCheckWithNote(ctx context.Context, uid int64, pa
 	return args.String(0), note, noteDTO, args.Error(3)
 }
 
+func (m *MockNoteService) HoldNoteWriteLock(uid, vaultID int64, pathHashes []string, fn func() error) error {
+	if fn == nil {
+		return nil
+	}
+	return fn()
+}
+
 func (m *MockNoteService) ModifyOrCreate(ctx context.Context, uid int64, params *dto.NoteModifyOrCreateRequest, mtimeCheck bool, existingNote ...*domain.Note) (bool, *dto.NoteDTO, error) {
 	args := m.Called(ctx, uid, params, mtimeCheck, existingNote)
 	if v := args.Get(1); v != nil {

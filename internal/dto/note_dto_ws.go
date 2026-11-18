@@ -69,6 +69,9 @@ type NoteModifyAckMessage struct {
 	LastTime int64  `json:"lastTime"` // Server write timestamp // 服务端写入时间戳
 	Path     string `json:"path"`     // Note path // 笔记路径
 	PathHash string `json:"pathHash"` // Path hash // 路径哈希值
+	// AtomicApplied is true only when this ack is for an opt-in conditional write.
+	// AtomicApplied 仅在该 ACK 对应 opt-in 条件写入时为 true。
+	AtomicApplied bool `json:"atomicApplied,omitempty"`
 }
 
 // NoteRenameAckMessage note rename operation ACK, sent back to sender after server processes NoteRename

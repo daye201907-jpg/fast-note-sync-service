@@ -1238,13 +1238,33 @@ Schema: `app.Res`
 ### Health check
 **Endpoint**: `GET /api/health`
 
-Check service health status, including database connection
+Check service health status, including database connection. `status`, `version`, `uptime`, and `database` are unchanged. This build also returns `capabilities`.
+
+`capabilities` is absent on a 3.6.1 binary. A client must not send `atomic: true` unless, immediately before that submit, this response has `capabilities.atomicNoteWrite.supported == true` and `capabilities.atomicNoteWrite.enabled == true`. Startup-only checks are not enough: a rollback or another replica can sit between the check and the write. A later `code: 1` without `data.atomicApplied` means the write was not an atomic commit and may already have been stored.
 
 **Parameters**:
 None
 
 **Success Response (200)**:
 Schema: `api_router.HealthResponse`
+
+```json
+{
+  "code": 1,
+  "status": true,
+  "data": {
+    "status": "healthy",
+    "version": "3.6.1",
+    "uptime": 1.5,
+    "database": "connected",
+    "capabilities": {
+      "atomicNoteWrite": {"supported": true, "enabled": true}
+    }
+  }
+}
+```
+
+`enabled` is false when `FNS_ATOMIC_NOTE_WRITE` is `0`, `false`, `off`, or `no`. The four original fields stay present.
 
 ---
 

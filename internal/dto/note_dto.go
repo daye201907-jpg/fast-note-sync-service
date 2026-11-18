@@ -33,6 +33,7 @@ type NoteModifyOrCreateRequest struct {
 	CreateOnly      bool   `json:"createOnly" form:"createOnly" example:"false"`                 // If true, fail if note already exists // 如果为 true，笔记已存在则失败
 	Context            string `json:"context" form:"context" example:"ctx123"`                      // Context // 同步上下文
 	IsConflictResolved bool   `json:"isConflictResolved" form:"isConflictResolved" example:"false"` // Marks if conflict is resolved manually // 标记是否为手动解决冲突
+	AtomicPrecondition
 }
 
 // ContentModifyRequest Request parameters for modifying content only
@@ -80,6 +81,7 @@ type NotePatchFrontmatterRequest struct {
 	PathHash string                 `json:"pathHash" form:"pathHash" example:"hash123"`                                                            // Path hash // 路径哈希
 	Updates  map[string]interface{} `json:"updates" form:"updates" swaggertype:"object,array,string" `                                             // Fields to update // 待更新字段
 	Remove   []string               `json:"remove" form:"remove" swaggertype:"array,string" swagexample:"[\"item1\",\"item2\"]" example:"old_tag"` // Fields to remove // 待移除字段
+	AtomicPrecondition
 }
 
 // NoteAppendRequest parameters for appending content to a note
@@ -89,6 +91,7 @@ type NoteAppendRequest struct {
 	Path     string `json:"path" form:"path" binding:"required" example:"ReadMe.md"`              // Note path // 笔记路径
 	PathHash string `json:"pathHash" form:"pathHash" example:"hash123"`                           // Path hash // 路径哈希
 	Content  string `json:"content" form:"content" binding:"required" example:"Appended content"` // Content to append // 追加内容
+	AtomicPrecondition
 }
 
 // NotePrependRequest parameters for prepending content to a note
@@ -98,6 +101,7 @@ type NotePrependRequest struct {
 	Path     string `json:"path" form:"path" binding:"required" example:"ReadMe.md"`                 // Note path // 笔记路径
 	PathHash string `json:"pathHash" form:"pathHash" example:"hash123"`                              // Path hash // 路径哈希
 	Content  string `json:"content" form:"content" binding:"required" example:"Prepended content\n"` // Content to prepend // 头部添加内容
+	AtomicPrecondition
 }
 
 // NoteReplaceRequest parameters for find/replace in a note
@@ -111,6 +115,7 @@ type NoteReplaceRequest struct {
 	Regex         bool   `json:"regex" form:"regex" example:"false"`                      // Use regex // 使用正则
 	All           bool   `json:"all" form:"all" example:"true"`                           // Replace all matches // 替换所有
 	FailIfNoMatch bool   `json:"failIfNoMatch" form:"failIfNoMatch" example:"true"`       // Fail if no match found // 若无匹配则失败
+	AtomicPrecondition
 }
 
 // NoteMoveRequest parameters for moving a note
@@ -238,6 +243,10 @@ type NoteDTO struct {
 	UpdatedTimestamp int64      `json:"lastTime"`                       // Record update timestamp // 记录更新时间戳
 	UpdatedAt        timex.Time `json:"updatedAt"`                      // Updated at time // 更新时间
 	CreatedAt        timex.Time `json:"createdAt"`                      // Created at time // 创建时间
+	// AtomicApplied is set only after this process performed an opt-in conditional write.
+	// Old binaries omit it. A code 1 response without it is not an atomic commit.
+	// AtomicApplied 仅在本进程完成 opt-in 条件写入后为 true。旧二进制不会输出该字段。
+	AtomicApplied bool `json:"atomicApplied,omitempty"`
 }
 
 // NoteNoContentDTO Note DTO without content

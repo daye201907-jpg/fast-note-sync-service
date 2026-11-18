@@ -39,4 +39,22 @@ func TestHealthHandler_Check_Success(t *testing.T) {
 
 	assert.Contains(t, w.Body.String(), `"status":"healthy"`)
 	assert.Contains(t, w.Body.String(), `"database":"connected"`)
+	assert.Contains(t, w.Body.String(), `"atomicNoteWrite":{"supported":true,"enabled":true}`)
+}
+
+func TestHealthHandler_Check_AtomicDisabledKeepsLegacyFields(t *testing.T) {
+	t.Setenv("FNS_ATOMIC_NOTE_WRITE", "0")
+	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	if err != nil {
+		t.Fatalf("failed to connect database: %v", err)
+	}
+	handler := NewHealthHandler(app.NewTestApp(nil, db))
+	c, w := newHealthTestContext()
+	handler.Check(c)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	assertResponseCode(t, w, code.Success.Code())
+	assert.Contains(t, w.Body.String(), `"status":"healthy"`)
+	assert.Contains(t, w.Body.String(), `"database":"connected"`)
+	assert.Contains(t, w.Body.String(), `"atomicNoteWrite":{"supported":true,"enabled":false}`)
 }
